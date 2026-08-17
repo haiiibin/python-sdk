@@ -13,6 +13,7 @@ from pydantic import AnyHttpUrl, AnyUrl
 
 from mcp.client.auth import OAuthClientProvider, PKCEParameters
 from mcp.client.auth.exceptions import OAuthFlowError, OAuthRegistrationError, OAuthTokenError
+from mcp.client.auth.oauth2 import client_secret_lapsed, token_error_code
 from mcp.client.auth.utils import (
     build_oauth_authorization_server_metadata_discovery_urls,
     build_protected_resource_metadata_discovery_urls,
@@ -3253,3 +3254,90 @@ async def test_issuer_is_stamped_when_same_origin_fallback_register_is_on_the_di
         await auth_flow.asend(httpx2.Response(200, request=final_req))
     except StopAsyncIteration:
         pass
+
+
+@pytest.mark.parametrize(
+    ("method", "expires_at", "expected"),
+    [
+        pytest.param("client_secret_post", 999, True, id="post-secret-past"),
+        pytest.param("client_secret_basic", 999, True, id="basic-secret-past"),
+        pytest.param("client_secret_post", 1001, False, id="secret-still-live"),
+        pytest.param("client_secret_post", 0, False, id="zero-never-expires"),
+        pytest.param("client_secret_post", None, False, id="expiry-undeclared"),
+        pytest.param("none", 999, False, id="public-client-ignores-secret-expiry"),
+    ],
+)
+def test_client_secret_lapsed_only_for_secret_auth_with_a_past_nonzero_expiry(
+    method: str, expires_at: int | None, expected: bool
+) -> None:
+    """RFC 7591 §3.2.1: a stored secret is dead once `client_secret_expires_at` (non-zero) is in the past.
+
+    Only registrations that authenticate with the secret are affected; `0` and an absent field
+    both mean no expiry is known.
+    """
+    info = OAuthClientInformationFull(
+        client_id="c", client_secret="s", client_secret_expires_at=expires_at, token_endpoint_auth_method=method
+    )
+    assert client_secret_lapsed(info, now=1000) is expected
+
+
+def test_client_secret_lapsed_defaults_to_the_current_time() -> None:
+    """Without an explicit `now`, the wall clock decides."""
+    info = OAuthClientInformationFull(
+        client_id="c",
+        client_secret="s",
+        client_secret_expires_at=int(time.time()) - 60,
+        token_endpoint_auth_method="client_secret_post",
+    )
+    assert client_secret_lapsed(info) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        pytest.param(400, b'{"error":"invalid_grant"}', "invalid_grant", id="400-json-error"),
+        pytest.param(401, b'{"error":"invalid_client","error_description":"x"}', "invalid_client", id="401-json-error"),
+        pytest.param(404, b'{"error":"invalid_client"}', None, id="non-token-error-status"),
+        pytest.param(400, b"<html>bad gateway</html>", None, id="non-json-body"),
+        pytest.param(400, b'["invalid_client"]', None, id="json-but-not-an-object"),
+        pytest.param(400, b'{"error": 7}', None, id="error-member-not-a-string"),
+    ],
+)
+async def test_token_error_code_reads_the_rfc6749_error_member_from_400_and_401_bodies(
+    status: int, body: bytes, expected: str | None
+) -> None:
+    """RFC 6749 §5.2 puts token-endpoint errors on 400, or 401 for `invalid_client`; anything else carries no code."""
+    response = httpx2.Response(status, content=body, request=httpx2.Request("POST", "https://as.example/token"))
+    assert await token_error_code(response) == expected
+
+
+@pytest.mark.anyio
+async def test_initialize_derives_expiry_from_the_loaded_token(
+    oauth_provider: OAuthClientProvider, mock_storage: MockTokenStorage, valid_tokens: OAuthToken
+) -> None:
+    """A token loaded from storage gets an expiry derived from its `expires_in` instead of counting as valid forever."""
+    await mock_storage.set_tokens(valid_tokens)
+    before = time.time()
+
+    await oauth_provider._initialize()
+
+    assert oauth_provider.context.token_expiry_time is not None
+    assert oauth_provider.context.token_expiry_time >= before + 3600
+
+
+@pytest.mark.anyio
+async def test_initialize_keeps_an_expiry_the_application_already_set(
+    oauth_provider: OAuthClientProvider, mock_storage: MockTokenStorage, valid_tokens: OAuthToken
+) -> None:
+    """An application that records the real expiry and assigns `context.token_expiry_time` itself is not overridden.
+
+    Storages in the wild set it before the first request or from inside `get_tokens`; the value
+    derived from a persisted relative `expires_in` would be staler than theirs.
+    """
+    await mock_storage.set_tokens(valid_tokens)
+    oauth_provider.context.token_expiry_time = 12345.0
+
+    await oauth_provider._initialize()
+
+    assert oauth_provider.context.token_expiry_time == 12345.0

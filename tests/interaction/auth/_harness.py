@@ -26,7 +26,14 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server import Server
 from mcp.server.auth.provider import AccessToken, ProviderTokenVerifier
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
-from mcp.shared.auth import AuthorizationCodeResult, OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from mcp.shared.auth import (
+    AuthorizationCodeResult,
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+    OAuthToken,
+    ProtectedResourceMetadata,
+)
 from tests.interaction._connect import BASE_URL, NO_DNS_REBINDING_PROTECTION
 from tests.interaction.auth._provider import InMemoryAuthorizationServerProvider
 from tests.interaction.transports._bridge import StreamingASGITransport
@@ -107,13 +114,23 @@ class InMemoryTokenStorage:
     Tests pre-seed `client_info` (via the constructor or by assignment) to drive the
     pre-registered path, and read both attributes after the flow to assert what the SDK
     persisted.
+
+    `report_expired_on_load`: `get_tokens` returns the held token with `expires_in=0`, standing
+    in for an application storage that records an absolute expiry and reports the remaining
+    lifetime on load, so a freshly constructed provider knows the access token is already dead
+    before it sends anything.
     """
 
-    def __init__(self, *, client_info: OAuthClientInformationFull | None = None) -> None:
+    def __init__(
+        self, *, client_info: OAuthClientInformationFull | None = None, report_expired_on_load: bool = False
+    ) -> None:
         self.tokens: OAuthToken | None = None
         self.client_info: OAuthClientInformationFull | None = client_info
+        self.report_expired_on_load = report_expired_on_load
 
     async def get_tokens(self) -> OAuthToken | None:
+        if self.tokens is not None and self.report_expired_on_load:
+            return self.tokens.model_copy(update={"expires_in": 0})
         return self.tokens
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
@@ -182,6 +199,7 @@ def auth_settings(
     required_scopes: Sequence[str] = ("mcp",),
     valid_scopes: Sequence[str] | None = None,
     identity_assertion_enabled: bool = False,
+    client_secret_expiry_seconds: int | None = None,
 ) -> AuthSettings:
     """Build `AuthSettings` for the co-hosted authorization + resource server.
 
@@ -195,6 +213,9 @@ def auth_settings(
     `identity_assertion_enabled` advertises and accepts the SEP-990 ID-JAG grant (RFC 7523
     jwt-bearer); the provider must implement `exchange_identity_assertion` for the endpoint to
     issue tokens.
+
+    `client_secret_expiry_seconds` makes dynamic registration issue secrets that expire that many
+    seconds after issuance (`client_secret_expires_at`), which the token endpoint then enforces.
     """
     required = list(required_scopes)
     valid = list(valid_scopes) if valid_scopes is not None else required
@@ -203,7 +224,10 @@ def auth_settings(
         resource_server_url=AnyHttpUrl(f"{BASE_URL}/mcp"),
         required_scopes=required,
         client_registration_options=ClientRegistrationOptions(
-            enabled=True, valid_scopes=valid, default_scopes=required
+            enabled=True,
+            valid_scopes=valid,
+            default_scopes=required,
+            client_secret_expiry_seconds=client_secret_expiry_seconds,
         ),
         revocation_options=RevocationOptions(enabled=False),
         identity_assertion_enabled=identity_assertion_enabled,
@@ -271,6 +295,55 @@ def shim(
 ) -> AppShim:
     """Build an `app_shim` for `connect_with_oauth` that applies `shimmed_app` with these overrides."""
     return lambda app: shimmed_app(app, not_found=not_found, serve=serve)
+
+
+def path_prefixed_as_shim(prefix: str) -> AppShim:
+    """Build an `app_shim` that presents the co-hosted authorization server as living under `prefix`.
+
+    The SDK server mounts `/authorize`, `/token` and `/register` at the origin root whatever the
+    issuer, so an authorization server whose endpoints sit under a path (a common hosted shape,
+    e.g. `https://host/oauth2/v1/token`) cannot be configured natively. This shim serves
+    protected-resource metadata naming `{BASE_URL}{prefix}` as the authorization server, serves
+    that issuer's metadata at the RFC 8414 path-inserted well-known URL with every endpoint under
+    the prefix, forwards `{prefix}/x` to the real `/x` route, and 404s the bare root endpoints and
+    root metadata so a client that guesses origin-root paths fails the way it would against such
+    a server. Pair with `InMemoryAuthorizationServerProvider(issuer=f"{BASE_URL}{prefix}")` so
+    the RFC 9207 `iss` on the redirect matches.
+    """
+    issuer = f"{BASE_URL}{prefix}"
+    prm = ProtectedResourceMetadata(resource=AnyHttpUrl(f"{BASE_URL}/mcp"), authorization_servers=[AnyHttpUrl(issuer)])
+    asm = OAuthMetadata(
+        issuer=AnyHttpUrl(issuer),
+        authorization_endpoint=AnyHttpUrl(f"{issuer}/authorize"),
+        token_endpoint=AnyHttpUrl(f"{issuer}/token"),
+        registration_endpoint=AnyHttpUrl(f"{issuer}/register"),
+        scopes_supported=["mcp"],
+        response_types_supported=["code"],
+        grant_types_supported=["authorization_code", "refresh_token"],
+        token_endpoint_auth_methods_supported=["client_secret_post", "client_secret_basic", "none"],
+        code_challenge_methods_supported=["S256"],
+    )
+
+    def factory(app: ASGIApp) -> ASGIApp:
+        inner = shimmed_app(
+            app,
+            not_found=frozenset({"/token", "/authorize", "/register", "/.well-known/oauth-authorization-server"}),
+            serve={
+                "/.well-known/oauth-protected-resource/mcp": metadata_body(prm),
+                f"/.well-known/oauth-authorization-server{prefix}": metadata_body(asm),
+            },
+        )
+
+        async def wrapped(scope: Scope, receive: Receive, send: Send) -> None:
+            if scope["type"] == "http" and scope["path"].startswith(f"{prefix}/"):
+                path = scope["path"][len(prefix) :]
+                await app({**scope, "path": path, "raw_path": path.encode()}, receive, send)
+                return
+            await inner(scope, receive, send)
+
+        return wrapped
+
+    return factory
 
 
 @dataclass

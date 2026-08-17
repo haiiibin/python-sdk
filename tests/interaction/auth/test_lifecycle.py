@@ -18,19 +18,25 @@ from mcp_types import INTERNAL_ERROR, ListToolsResult, Tool
 from pydantic import AnyHttpUrl, AnyUrl
 
 from mcp import MCPError
+from mcp.client.auth import OAuthClientProvider, OAuthTokenError
 from mcp.client.auth.extensions.client_credentials import ClientCredentialsOAuthProvider, PrivateKeyJWTOAuthProvider
 from mcp.server import Server, ServerRequestContext
+from mcp.server.auth.settings import AuthSettings
 from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata
 from tests.interaction._connect import BASE_URL
 from tests.interaction._requirements import requirement
 from tests.interaction.auth._harness import (
     REDIRECT_URI,
+    AppShim,
+    HeadlessOAuth,
     InMemoryTokenStorage,
     RecordedRequest,
     auth_settings,
     connect_with_oauth,
     m2m_token_shim,
     metadata_body,
+    oauth_client_metadata,
+    path_prefixed_as_shim,
     record_requests,
     shim,
     step_up_shim,
@@ -96,6 +102,44 @@ def seeded_client(provider: InMemoryAuthorizationServerProvider, **kwargs: objec
     assert info.client_id is not None
     provider.clients[info.client_id] = info
     return info
+
+
+async def first_process_login(
+    provider: InMemoryAuthorizationServerProvider,
+    storage: InMemoryTokenStorage,
+    *,
+    settings: AuthSettings | None = None,
+    app_shim: AppShim | None = None,
+) -> None:
+    """Run one interactive connect so `storage` holds what a first process would leave on disk.
+
+    The restart scenarios below then build a fresh `OAuthClientProvider` over the same storage,
+    which is exactly what a second process does; nothing is seeded by hand, so the registration
+    and tokens carry whatever the SDK really persists (issuer stamp, secret expiry, scope).
+    """
+    server = Server("guarded", on_list_tools=list_tools)
+    async with connect_with_oauth(server, provider=provider, storage=storage, settings=settings, app_shim=app_shim) as (
+        client,
+        _,
+    ):
+        await client.list_tools()
+    assert storage.tokens is not None and storage.tokens.refresh_token is not None
+    assert storage.client_info is not None and storage.client_info.issuer is not None
+
+
+def restarted_provider(storage: InMemoryTokenStorage, headless: HeadlessOAuth | None = None) -> OAuthClientProvider:
+    """A provider as a second process would construct it: same storage, fresh in-memory state.
+
+    With `headless=None` no redirect or callback handler is wired, so reaching the interactive
+    step raises rather than silently opening a browser the scenario says is unavailable.
+    """
+    return OAuthClientProvider(
+        server_url=f"{BASE_URL}/mcp",
+        client_metadata=oauth_client_metadata(),
+        storage=storage,
+        redirect_handler=headless.redirect_handler if headless is not None else None,
+        callback_handler=headless.callback_handler if headless is not None else None,
+    )
 
 
 @requirement("client-auth:refresh:transparent")
@@ -352,6 +396,283 @@ async def test_a_failed_refresh_clears_stored_tokens_and_restarts_the_full_flow(
     assert storage.client_info is not None
     assert storage.tokens is not None
     assert storage.tokens.access_token in provider.access_tokens
+
+
+@requirement("client-auth:refresh:on-401")
+async def test_a_restarted_client_answers_a_401_with_its_stored_refresh_token() -> None:
+    """A second process holding only persisted tokens and registration refreshes on 401 instead of re-authorizing.
+
+    Steps: (1) a first process logs in interactively and its storage keeps the registration and a
+    refresh token; (2) the server-side access token lapses; (3) a fresh provider over the same
+    storage, with no browser available, connects. The recording proves the stale bearer drew a
+    401, discovery ran, exactly one `refresh_token` grant followed, and neither `/authorize` nor
+    `/register` was touched. SDK behaviour per RFC 6749 §1.5; regression bar for #3250/#1318.
+    """
+    provider = InMemoryAuthorizationServerProvider()
+    storage = InMemoryTokenStorage()
+    with anyio.fail_after(5):
+        await first_process_login(provider, storage)
+    assert storage.tokens is not None
+    stale_access_token = storage.tokens.access_token
+    provider.expire_access_token(stale_access_token)
+
+    recorded, on_request = record_requests()
+    server = Server("guarded", on_list_tools=list_tools)
+    with anyio.fail_after(5):
+        async with connect_with_oauth(
+            server, provider=provider, auth=restarted_provider(storage), on_request=on_request
+        ) as (client, _):
+            result = await client.list_tools()
+
+    assert result.tools[0].name == "echo"
+    assert [(r.method, r.path) for r in recorded[:5]] == snapshot(
+        [
+            ("POST", "/mcp"),
+            ("GET", "/.well-known/oauth-protected-resource/mcp"),
+            ("GET", "/.well-known/oauth-authorization-server"),
+            ("POST", "/token"),
+            ("POST", "/mcp"),
+        ]
+    )
+    assert recorded[0].headers["authorization"] == f"Bearer {stale_access_token}"
+    assert [form_body(r)["grant_type"] for r in find(recorded, "POST", "/token")] == ["refresh_token"]
+    assert find(recorded, "GET", "/authorize") == [] and find(recorded, "POST", "/register") == []
+    assert storage.tokens.access_token != stale_access_token
+    assert storage.tokens.access_token in provider.access_tokens
+
+
+@requirement("client-auth:refresh:discovered-endpoint")
+async def test_a_refresh_before_the_first_request_discovers_metadata_and_posts_to_the_advertised_token_endpoint() -> (
+    None
+):
+    """A cold-start refresh against an authorization server under a path targets the metadata's token endpoint.
+
+    The authorization server's endpoints live under `/oauth2/v1` and the bare `/token` 404s. The
+    second process's storage reports the loaded token as already expired, so the provider
+    refreshes before sending anything; the recording proves discovery ran first and the single
+    refresh POST went to `/oauth2/v1/token`, with no 401 and no browser. Regression bar for #3240.
+    """
+    prefix = "/oauth2/v1"
+    provider = InMemoryAuthorizationServerProvider(issuer=f"{BASE_URL}{prefix}")
+    storage = InMemoryTokenStorage()
+    app_shim = path_prefixed_as_shim(prefix)
+    with anyio.fail_after(5):
+        await first_process_login(provider, storage, app_shim=app_shim)
+    storage.report_expired_on_load = True
+
+    recorded, on_request = record_requests()
+    server = Server("guarded", on_list_tools=list_tools)
+    with anyio.fail_after(5):
+        async with connect_with_oauth(
+            server, provider=provider, auth=restarted_provider(storage), app_shim=app_shim, on_request=on_request
+        ) as (client, _):
+            result = await client.list_tools()
+
+    assert result.tools[0].name == "echo"
+    assert [(r.method, r.path) for r in recorded[:4]] == snapshot(
+        [
+            ("GET", "/.well-known/oauth-protected-resource/mcp"),
+            ("GET", "/.well-known/oauth-authorization-server/oauth2/v1"),
+            ("POST", "/oauth2/v1/token"),
+            ("POST", "/mcp"),
+        ]
+    )
+    token_posts = [r for r in recorded if r.method == "POST" and r.path.endswith("/token")]
+    assert [(r.path, form_body(r)["grant_type"]) for r in token_posts] == [("/oauth2/v1/token", "refresh_token")]
+    assert all("authorization" in r.headers for r in recorded if r.path == "/mcp")
+    assert not any(r.path.endswith("/authorize") for r in recorded)
+
+
+@requirement("client-auth:registration:secret-expiry")
+async def test_a_stored_registration_with_a_lapsed_secret_is_replaced_before_authorizing() -> None:
+    """A registration whose RFC 7591 `client_secret_expires_at` has passed is discarded and re-made before any consent.
+
+    Steps: (1) first process registers (the server issues secrets expiring in an hour) and logs
+    in; (2) the secret's expiry passes on both sides and the storage reports the access token as
+    expired too; (3) a second process with a browser connects. The cold-start pass discovers,
+    finds the registration unusable and drops it (with its tokens) without registering
+    unprompted; the now-unauthenticated request draws the 401 whose flow registers a new client
+    and authorizes once. The dead client_id never reaches `/authorize` or `/token`.
+    Regression bar for #3256's proactive half.
+    """
+    settings = auth_settings(client_secret_expiry_seconds=3600)
+    provider = InMemoryAuthorizationServerProvider()
+    storage = InMemoryTokenStorage()
+    with anyio.fail_after(5):
+        await first_process_login(provider, storage, settings=settings)
+    assert storage.client_info is not None
+    dead_client_id = storage.client_info.client_id
+    provider.lapse_client_secret(dead_client_id)
+    storage.client_info = provider.clients[dead_client_id].model_copy(update={"issuer": storage.client_info.issuer})
+    storage.report_expired_on_load = True
+
+    recorded, on_request = record_requests()
+    headless = HeadlessOAuth()
+    server = Server("guarded", on_list_tools=list_tools)
+    with anyio.fail_after(5):
+        async with connect_with_oauth(
+            server,
+            provider=provider,
+            settings=settings,
+            auth=restarted_provider(storage, headless),
+            headless=headless,
+            on_request=on_request,
+        ) as (client, _):
+            result = await client.list_tools()
+
+    assert result.tools[0].name == "echo"
+    assert [(r.method, r.path) for r in recorded[:8]] == snapshot(
+        [
+            ("GET", "/.well-known/oauth-protected-resource/mcp"),
+            ("GET", "/.well-known/oauth-authorization-server"),
+            ("POST", "/mcp"),
+            ("GET", "/.well-known/oauth-protected-resource/mcp"),
+            ("GET", "/.well-known/oauth-authorization-server"),
+            ("POST", "/register"),
+            ("GET", "/authorize"),
+            ("POST", "/token"),
+        ]
+    )
+    assert "authorization" not in recorded[2].headers
+    assert storage.client_info.client_id != dead_client_id
+    assert authorize_params(headless.authorize_urls[0])["client_id"] == storage.client_info.client_id
+    assert len(headless.authorize_urls) == 1
+    assert all(form_body(r).get("client_id") != dead_client_id for r in find(recorded, "POST", "/token"))
+
+
+@requirement("client-auth:invalid-client-clears-all")
+async def test_an_invalid_client_on_refresh_discards_the_registration_and_reregisters() -> None:
+    """When only the server knows the registration is dead, `invalid_client` on refresh triggers one re-registration.
+
+    The stored record still claims a live secret, so nothing is dropped proactively; the 401 flow
+    refreshes, the token endpoint answers 401 `invalid_client`, and the flow discards the
+    registration with its tokens, registers again, and authorizes with the new client. Reactive
+    half of #3256; the TypeScript SDK's `invalidateCredentials('client')` equivalent.
+    """
+    settings = auth_settings(client_secret_expiry_seconds=3600)
+    provider = InMemoryAuthorizationServerProvider()
+    storage = InMemoryTokenStorage()
+    with anyio.fail_after(5):
+        await first_process_login(provider, storage, settings=settings)
+    assert storage.client_info is not None and storage.tokens is not None
+    dead_client_id = storage.client_info.client_id
+    provider.lapse_client_secret(dead_client_id)
+    provider.expire_access_token(storage.tokens.access_token)
+
+    recorded, on_request = record_requests()
+    headless = HeadlessOAuth()
+    server = Server("guarded", on_list_tools=list_tools)
+    with anyio.fail_after(5):
+        async with connect_with_oauth(
+            server,
+            provider=provider,
+            settings=settings,
+            auth=restarted_provider(storage, headless),
+            headless=headless,
+            on_request=on_request,
+        ) as (client, _):
+            result = await client.list_tools()
+
+    assert result.tools[0].name == "echo"
+    assert [(r.method, r.path) for r in recorded[:7]] == snapshot(
+        [
+            ("POST", "/mcp"),
+            ("GET", "/.well-known/oauth-protected-resource/mcp"),
+            ("GET", "/.well-known/oauth-authorization-server"),
+            ("POST", "/token"),
+            ("POST", "/register"),
+            ("GET", "/authorize"),
+            ("POST", "/token"),
+        ]
+    )
+    token_posts = find(recorded, "POST", "/token")
+    assert [(form_body(r)["grant_type"], form_body(r)["client_id"] == dead_client_id) for r in token_posts] == snapshot(
+        [("refresh_token", True), ("authorization_code", False)]
+    )
+    assert storage.client_info.client_id != dead_client_id
+    assert len(headless.authorize_urls) == 1
+
+
+@requirement("client-auth:invalid-client-clears-all")
+async def test_an_invalid_client_at_the_code_exchange_reregisters_and_authorizes_once_more() -> None:
+    """A dead registration revealed only at the code exchange is replaced and the flow authorizes once more.
+
+    The second process holds the SDK-minted registration but no tokens, and the server has
+    expired the secret without the stored record saying so. The first consent's exchange fails
+    `invalid_client`; the flow discards the registration, registers again, and authorizes a
+    second time, which succeeds. Two `/authorize` visits is the price of an undeclared expiry.
+    """
+    settings = auth_settings(client_secret_expiry_seconds=3600)
+    provider = InMemoryAuthorizationServerProvider()
+    storage = InMemoryTokenStorage()
+    with anyio.fail_after(5):
+        await first_process_login(provider, storage, settings=settings)
+    assert storage.client_info is not None
+    dead_client_id = storage.client_info.client_id
+    provider.lapse_client_secret(dead_client_id)
+    storage.tokens = None
+
+    recorded, on_request = record_requests()
+    headless = HeadlessOAuth()
+    server = Server("guarded", on_list_tools=list_tools)
+    with anyio.fail_after(5):
+        async with connect_with_oauth(
+            server,
+            provider=provider,
+            settings=settings,
+            auth=restarted_provider(storage, headless),
+            headless=headless,
+            on_request=on_request,
+        ) as (client, _):
+            result = await client.list_tools()
+
+    assert result.tools[0].name == "echo"
+    assert [(r.method, r.path) for r in recorded[:8]] == snapshot(
+        [
+            ("POST", "/mcp"),
+            ("GET", "/.well-known/oauth-protected-resource/mcp"),
+            ("GET", "/.well-known/oauth-authorization-server"),
+            ("GET", "/authorize"),
+            ("POST", "/token"),
+            ("POST", "/register"),
+            ("GET", "/authorize"),
+            ("POST", "/token"),
+        ]
+    )
+    assert [authorize_params(u)["client_id"] == dead_client_id for u in headless.authorize_urls] == [True, False]
+    assert storage.client_info.client_id != dead_client_id
+    assert storage.tokens is not None and storage.tokens.access_token in provider.access_tokens
+
+
+@requirement("client-auth:invalid-client-clears-all")
+async def test_an_invalid_client_for_pre_registered_credentials_surfaces_as_a_token_error() -> None:
+    """A registration the application supplied is never swapped for a dynamic one; `invalid_client` surfaces.
+
+    The stored client info carries no SDK issuer stamp (it was pre-registered), so when the
+    token endpoint rejects its lapsed secret the flow raises `OAuthTokenError` rather than
+    registering behind the operator's back. The recording proves no `/register` was attempted.
+    """
+    provider = InMemoryAuthorizationServerProvider()
+    info = seeded_client(
+        provider,
+        client_id="preregistered",
+        client_secret="issued-out-of-band",
+        token_endpoint_auth_method="client_secret_post",
+    )
+    provider.lapse_client_secret("preregistered")
+    storage = InMemoryTokenStorage(client_info=info)
+    recorded, on_request = record_requests()
+    server = Server("guarded", on_list_tools=list_tools)
+
+    with anyio.fail_after(5):
+        with pytest.RaisesGroup(pytest.RaisesExc(OAuthTokenError), flatten_subgroups=True):
+            await connect_with_oauth(server, provider=provider, storage=storage, on_request=on_request).__aenter__()
+
+    counts = path_counts(recorded)
+    assert counts[("POST", "/register")] == 0
+    assert counts[("GET", "/authorize")] == 1
+    assert counts[("POST", "/token")] == 1
+    assert storage.client_info is info
 
 
 @requirement("client-auth:client-credentials")

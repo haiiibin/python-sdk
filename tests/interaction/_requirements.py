@@ -3783,22 +3783,16 @@ REQUIREMENTS: dict[str, Requirement] = {
         note="OAuth is HTTP-only.",
     ),
     "client-auth:invalid-client-clears-all": Requirement(
-        source="sdk",
+        source="issue:#3256",
         behavior=(
-            "An invalid-client or unauthorized-client error during authorization invalidates all stored credentials."
+            "An invalid_client error from the token endpoint (refresh or code exchange) for a registration "
+            "the SDK obtained itself discards that registration and the tokens bound to it, and the flow "
+            "re-registers and continues once; for pre-registered credentials the error surfaces instead."
         ),
         transports=("streamable-http",),
-        note="OAuth is HTTP-only.",
-        divergence=Divergence(
-            note=(
-                "The token-response handlers do not parse the error body; an invalid_client or "
-                "unauthorized_client response leaves stored client_info untouched. The TypeScript SDK "
-                "clears it."
-            ),
-        ),
-        deferred=(
-            "Not implemented in the SDK: no token-response path inspects the error code to decide "
-            "whether to clear client_info."
+        note=(
+            "OAuth is HTTP-only. Registrations the SDK minted carry the SEP-2352 issuer stamp; that is the "
+            "provenance test. unauthorized_client is not treated the same way (the TypeScript SDK does)."
         ),
     ),
     "client-auth:invalid-grant-clears-tokens": Requirement(
@@ -3882,6 +3876,36 @@ REQUIREMENTS: dict[str, Requirement] = {
         ),
         transports=("streamable-http",),
         note="OAuth is HTTP-only.",
+    ),
+    "client-auth:refresh:on-401": Requirement(
+        source="issue:#3250",
+        behavior=(
+            "A 401 received while a refresh token is held is answered, after rediscovery, with a "
+            "refresh_token grant before any interactive authorization, so a client constructed over "
+            "persisted tokens and client registration recovers from an expired access token headlessly."
+        ),
+        transports=("streamable-http",),
+        note="OAuth is HTTP-only. RFC 6749 §1.5 (E)-(H); matches the TypeScript, C# and Rust SDKs.",
+    ),
+    "client-auth:refresh:discovered-endpoint": Requirement(
+        source="issue:#3240",
+        behavior=(
+            "A refresh attempted before the first request of a process (the loaded token is known to be "
+            "expired) performs protected-resource and authorization-server metadata discovery first and "
+            "posts to the advertised token endpoint, never to a path guessed from the server origin."
+        ),
+        transports=("streamable-http",),
+        note="OAuth is HTTP-only.",
+    ),
+    "client-auth:registration:secret-expiry": Requirement(
+        source="issue:#3256",
+        behavior=(
+            "A stored dynamically registered client whose client_secret_expires_at (RFC 7591) has passed is "
+            "treated as absent: the flow registers afresh before authorizing instead of presenting the dead "
+            "secret at the token endpoint."
+        ),
+        transports=("streamable-http",),
+        note="OAuth is HTTP-only. 0 means the secret never expires; only secret-based auth methods are affected.",
     ),
     "client-auth:resource-parameter": Requirement(
         source=f"{SPEC_BASE_URL}/basic/authorization#resource-parameter-implementation",

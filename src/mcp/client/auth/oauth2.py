@@ -10,14 +10,16 @@ import secrets
 import string
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import aclosing
 from dataclasses import dataclass, field
-from typing import Any, Protocol, get_args
+from typing import Any, Protocol, cast, get_args
 from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import anyio
 import httpx2
 from mcp_types.version import is_version_at_least
 from pydantic import BaseModel, Field, ValidationError
+from pydantic_core import from_json
 
 from mcp.client.auth.exceptions import OAuthFlowError, OAuthRegistrationError, OAuthTokenError
 from mcp.client.auth.utils import (
@@ -107,6 +109,31 @@ def check_registration_usable(client_info: OAuthClientInformationFull) -> None:
         raise OAuthRegistrationError(
             f"Authorization server registered the client for {method!r} but issued no client_secret"
         )
+
+
+def client_secret_lapsed(client_info: OAuthClientInformationFull, now: float | None = None) -> bool:
+    """Whether a stored registration authenticates with a secret the server has declared expired.
+
+    RFC 7591 §3.2.1: `client_secret_expires_at` is the time the secret stops working, with `0`
+    meaning it never does. Only registrations that present the secret at the token endpoint
+    (`client_secret_post`/`client_secret_basic`) are made unusable by its lapse.
+    """
+    expires_at = client_info.client_secret_expires_at
+    if not expires_at or client_info.token_endpoint_auth_method not in _SECRET_TOKEN_ENDPOINT_AUTH_METHODS:
+        return False
+    return expires_at < (time.time() if now is None else now)
+
+
+async def token_error_code(response: httpx2.Response) -> str | None:
+    """The RFC 6749 §5.2 `error` code carried by a failed token-endpoint response, if any."""
+    if response.status_code not in (400, 401):
+        return None
+    try:
+        body = from_json(await response.aread())
+    except ValueError:
+        return None
+    error = cast(dict[str, Any], body).get("error") if isinstance(body, dict) else None
+    return error if isinstance(error, str) else None
 
 
 class PKCEParameters(BaseModel):
@@ -550,6 +577,12 @@ class OAuthClientProvider(httpx2.Auth):
     async def _initialize(self) -> None:
         """Load stored tokens and client info."""
         self.context.current_tokens = await self.context.storage.get_tokens()
+        # Derive an expiry from the loaded token unless the application already set one (some
+        # storages assign `context.token_expiry_time` before or during `get_tokens`). A storage
+        # that persists tokens verbatim yields a stale window here; that costs one 401 round-trip,
+        # after which `_reacquire_tokens` refreshes.
+        if self.context.current_tokens is not None and self.context.token_expiry_time is None:
+            self.context.update_token_expiry(self.context.current_tokens)
         self.context.client_info = await self.context.storage.get_client_info()
         self._initialized = True
 
@@ -577,6 +610,222 @@ class OAuthClientProvider(httpx2.Auth):
         if not check_resource_allowed(requested_resource=default_resource, configured_resource=prm_resource):
             raise OAuthFlowError(f"Protected resource {prm_resource} does not match expected {default_resource}")
 
+    def _sdk_minted_registration(self) -> bool:
+        """Whether the held registration is one this SDK obtained (DCR/CIMD) and may therefore replace.
+
+        The flow stamps `issuer` on every registration it mints (SEP-2352); pre-registered
+        credentials - seeded into storage by the application, or fixed by the client-credentials
+        providers - carry none, and discarding those to attempt dynamic registration would swap an
+        operator-provisioned client for a dynamic one behind their back.
+        """
+        return self.context.client_info is not None and self.context.client_info.issuer is not None
+
+    def _discard_registration(self, reason: str) -> None:
+        """Forget the held registration and the tokens bound to it so the flow re-registers."""
+        logger.debug(f"{reason}; discarding stored client registration and its tokens")
+        self.context.client_info = None
+        self.context.clear_tokens()
+
+    async def _reacquire_tokens(
+        self, challenge: httpx2.Response | None
+    ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
+        """Obtain usable tokens: discover, ensure a usable registration, refresh, else authorize.
+
+        Both entry points of `async_auth_flow` drive this one sequence so every check in it applies
+        to each. `challenge` is the 401 that prompted it (its `WWW-Authenticate` hints anchor
+        discovery and scope selection), or None when the client noticed before sending anything
+        that its access token had expired; in that case the sequence stops short of registering or
+        authorizing interactively and lets the request go out, so a real 401 drives those instead.
+        """
+        # Step 1-2: discovery. Always on a 401 (the AS may have changed); before a cold-start
+        # refresh only when nothing has been discovered yet in this process.
+        if challenge is not None or self.context.oauth_metadata is None:
+            www_auth_resource_metadata_url = (
+                extract_resource_metadata_from_www_auth(challenge) if challenge is not None else None
+            )
+
+            # Step 1: Discover protected resource metadata (SEP-985 with fallback support)
+            prm_discovery_urls = build_protected_resource_metadata_discovery_urls(
+                www_auth_resource_metadata_url, self.context.server_url
+            )
+
+            for url in prm_discovery_urls:  # pragma: no branch
+                discovery_request = create_oauth_metadata_request(url)
+
+                discovery_response = yield discovery_request  # sending request
+
+                prm = await handle_protected_resource_response(discovery_response)
+                if prm:
+                    # Validate PRM resource matches server URL (RFC 8707)
+                    await self._validate_resource_match(prm)
+                    self.context.protected_resource_metadata = prm
+
+                    # todo: try all authorization_servers to find the OASM
+                    assert (
+                        len(prm.authorization_servers) > 0
+                    )  # this is always true as authorization_servers has a min length of 1
+
+                    self.context.auth_server_url = str(prm.authorization_servers[0])
+                    break
+                else:
+                    logger.debug(f"Protected resource metadata discovery failed: {url}")
+
+            # SEP-2352: stored credentials are bound to the issuer that registered them.
+            # If the authorization server changed, drop them (and the old tokens) so the
+            # flow re-registers instead of presenting another server's credentials.
+            if (
+                self.context.client_info is not None
+                and self.context.auth_server_url is not None
+                and not credentials_match_issuer(
+                    self.context.client_info, self.context.auth_server_url, self.context.client_metadata_url
+                )
+            ):
+                self._discard_registration("Authorization server changed")
+                # Any cached AS metadata is for the old server; drop it so a failed
+                # rediscovery cannot leak the old registration/token endpoints into Step 4.
+                self.context.oauth_metadata = None
+
+            asm_discovery_urls = build_oauth_authorization_server_metadata_discovery_urls(
+                self.context.auth_server_url, self.context.server_url
+            )
+
+            # Step 2: Discover OAuth Authorization Server Metadata (OASM) (with fallback for legacy servers)
+            for url in asm_discovery_urls:  # pragma: no branch
+                oauth_metadata_request = create_oauth_metadata_request(url)
+                oauth_metadata_response = yield oauth_metadata_request
+
+                ok, asm = await handle_auth_metadata_response(oauth_metadata_response)
+                if not ok:
+                    break
+                if ok and asm:
+                    # SEP-2468: metadata issuer must match the discovery issuer
+                    if self.context.auth_server_url is not None:
+                        validate_metadata_issuer(asm, self.context.auth_server_url)
+                    self.context.oauth_metadata = asm
+                    break
+                else:
+                    logger.debug(f"OAuth metadata discovery failed: {url}")
+
+            # SEP-2352: on the legacy no-PRM path the issuer is only known after ASM
+            # discovery, so re-evaluate the binding here using the discovered metadata
+            # issuer (mirroring the bound_issuer fallback in Step 4).
+            if (
+                self.context.client_info is not None
+                and self.context.auth_server_url is None
+                and self.context.oauth_metadata is not None
+                and not credentials_match_issuer(
+                    self.context.client_info,
+                    str(self.context.oauth_metadata.issuer),
+                    self.context.client_metadata_url,
+                )
+            ):
+                self._discard_registration("Authorization server changed")
+
+        # A registration this SDK minted (it carries the SEP-2352 issuer stamp) whose secret the
+        # server has declared expired (RFC 7591) can no longer authenticate any token request;
+        # treat it as absent so Step 4 replaces it. Pre-registered credentials are the app's to fix.
+        client_info = self.context.client_info
+        if client_info is not None and client_info.issuer is not None and client_secret_lapsed(client_info):
+            self._discard_registration("Stored client secret has expired")
+
+        # Step 3: Apply scope selection strategy
+        if challenge is not None:
+            self.context.client_metadata.scope = get_client_metadata_scopes(
+                extract_scope_from_www_auth(challenge),
+                self.context.protected_resource_metadata,
+                self.context.oauth_metadata,
+                self.context.client_metadata.grant_types,
+            )
+
+        # A token endpoint answering `invalid_client` means the registration itself is dead
+        # (RFC 6749 §5.2): it is discarded and steps 4-5 run once more, re-registering. Once only,
+        # so a replacement the server also rejects surfaces as an error instead of looping.
+        may_reregister = True
+        while True:
+            # Step 4: Register client or use URL-based client ID (CIMD)
+            if not self.context.client_info:
+                if challenge is None:
+                    # Nothing to refresh with and no 401 to justify registering; send the request.
+                    return
+                # SEP-2352: the issuer to bind these credentials to, when known.
+                discovered_issuer: str | None = None
+                if self.context.oauth_metadata is not None:
+                    discovered_issuer = self.context.auth_server_url or str(self.context.oauth_metadata.issuer)
+
+                if should_use_client_metadata_url(self.context.oauth_metadata, self.context.client_metadata_url):
+                    # Use URL-based client ID (CIMD). CIMD records are portable across
+                    # authorization servers, so the issuer stamp is informational.
+                    logger.debug(f"Using URL-based client ID (CIMD): {self.context.client_metadata_url}")
+                    client_information = create_client_info_from_metadata_url(
+                        self.context.client_metadata_url,  # type: ignore[arg-type]
+                        redirect_uris=self.context.client_metadata.redirect_uris,
+                    )
+                    client_information.issuer = discovered_issuer
+                    self.context.client_info = client_information
+                    await self.context.storage.set_client_info(client_information)
+                else:
+                    # Fallback to Dynamic Client Registration
+                    fallback_base = self.context.get_authorization_base_url(self.context.server_url)
+                    registration_request = create_client_registration_request(
+                        self.context.oauth_metadata, self.context.client_metadata, fallback_base
+                    )
+                    registration_response = yield registration_request
+                    client_information = await handle_registration_response(registration_response)
+                    check_registration_usable(client_information)
+                    # Only record the issuer when the registration above actually targeted
+                    # the discovered AS — either via its published registration_endpoint,
+                    # or because the resource-origin /register fallback is on the issuer's
+                    # own host (legacy same-origin embedded AS). Otherwise the fallback hit
+                    # a different server and recording a binding to the PRM-advertised AS
+                    # would persist a binding that was never established.
+                    if (
+                        self.context.oauth_metadata is not None
+                        and discovered_issuer is not None
+                        and (
+                            self.context.oauth_metadata.registration_endpoint is not None
+                            or self.context.get_authorization_base_url(discovered_issuer) == fallback_base
+                        )
+                    ):
+                        client_information.issuer = discovered_issuer
+                    self.context.client_info = client_information
+                    await self.context.storage.set_client_info(client_information)
+                    # Tokens are bound to the client they were issued to (RFC 6749 §6); whatever is
+                    # still held belonged to a previous registration and cannot be refreshed by this one.
+                    self.context.clear_tokens()
+
+            # Step 5a: a held refresh token is the first grant to try (RFC 6749 §1.5/§6).
+            if self.context.can_refresh_token():
+                refresh_response = yield await self._refresh_token()
+                if await self._handle_refresh_response(refresh_response):
+                    return
+                # Refresh failed: re-read storage on the next request.
+                self._initialized = False
+                if (
+                    may_reregister
+                    and self._sdk_minted_registration()
+                    and await token_error_code(refresh_response) == "invalid_client"
+                ):
+                    self._discard_registration("Token endpoint rejected the client credentials")
+                    may_reregister = False
+                    continue
+
+            if challenge is None:
+                # Cold-start path: never begin an interactive authorization unprompted.
+                return
+
+            # Step 5b: the provider's full grant (authorization code here; M2M providers override).
+            token_response = yield await self._perform_authorization()
+            if (
+                may_reregister
+                and self._sdk_minted_registration()
+                and await token_error_code(token_response) == "invalid_client"
+            ):
+                self._discard_registration("Token endpoint rejected the client credentials")
+                may_reregister = False
+                continue
+            await self._handle_token_response(token_response)
+            return
+
     async def async_auth_flow(self, request: httpx2.Request) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
         """httpx2 auth flow integration."""
         async with self.context.lock:
@@ -587,13 +836,14 @@ class OAuthClientProvider(httpx2.Auth):
             self.context.protocol_version = request.headers.get(MCP_PROTOCOL_VERSION_HEADER)
 
             if not self.context.is_token_valid() and self.context.can_refresh_token():
-                # Try to refresh token
-                refresh_request = await self._refresh_token()
-                refresh_response = yield refresh_request
-
-                if not await self._handle_refresh_response(refresh_response):
-                    # Refresh failed, need full re-authentication
-                    self._initialized = False
+                # The access token is known to have expired: refresh it before sending anything.
+                async with aclosing(self._reacquire_tokens(challenge=None)) as steps:
+                    try:
+                        step = await steps.__anext__()
+                        while True:
+                            step = await steps.asend((yield step))
+                    except StopAsyncIteration:
+                        pass
 
             if self.context.is_token_valid():
                 self._add_auth_header(request)
@@ -601,150 +851,14 @@ class OAuthClientProvider(httpx2.Auth):
             response = yield request
 
             if response.status_code == 401:
-                # Perform full OAuth flow
                 try:
-                    # OAuth flow must be inline due to generator constraints
-                    www_auth_resource_metadata_url = extract_resource_metadata_from_www_auth(response)
-
-                    # Step 1: Discover protected resource metadata (SEP-985 with fallback support)
-                    prm_discovery_urls = build_protected_resource_metadata_discovery_urls(
-                        www_auth_resource_metadata_url, self.context.server_url
-                    )
-
-                    for url in prm_discovery_urls:  # pragma: no branch
-                        discovery_request = create_oauth_metadata_request(url)
-
-                        discovery_response = yield discovery_request  # sending request
-
-                        prm = await handle_protected_resource_response(discovery_response)
-                        if prm:
-                            # Validate PRM resource matches server URL (RFC 8707)
-                            await self._validate_resource_match(prm)
-                            self.context.protected_resource_metadata = prm
-
-                            # todo: try all authorization_servers to find the OASM
-                            assert (
-                                len(prm.authorization_servers) > 0
-                            )  # this is always true as authorization_servers has a min length of 1
-
-                            self.context.auth_server_url = str(prm.authorization_servers[0])
-                            break
-                        else:
-                            logger.debug(f"Protected resource metadata discovery failed: {url}")
-
-                    # SEP-2352: stored credentials are bound to the issuer that registered them.
-                    # If the authorization server changed, drop them (and the old tokens) so the
-                    # flow re-registers instead of presenting another server's credentials.
-                    if (
-                        self.context.client_info is not None
-                        and self.context.auth_server_url is not None
-                        and not credentials_match_issuer(
-                            self.context.client_info, self.context.auth_server_url, self.context.client_metadata_url
-                        )
-                    ):
-                        logger.debug("Authorization server changed; discarding bound credentials and re-registering")
-                        self.context.client_info = None
-                        self.context.clear_tokens()
-                        # Any cached AS metadata is for the old server; drop it so a failed
-                        # rediscovery cannot leak the old registration/token endpoints into Step 4.
-                        self.context.oauth_metadata = None
-
-                    asm_discovery_urls = build_oauth_authorization_server_metadata_discovery_urls(
-                        self.context.auth_server_url, self.context.server_url
-                    )
-
-                    # Step 2: Discover OAuth Authorization Server Metadata (OASM) (with fallback for legacy servers)
-                    for url in asm_discovery_urls:  # pragma: no branch
-                        oauth_metadata_request = create_oauth_metadata_request(url)
-                        oauth_metadata_response = yield oauth_metadata_request
-
-                        ok, asm = await handle_auth_metadata_response(oauth_metadata_response)
-                        if not ok:
-                            break
-                        if ok and asm:
-                            # SEP-2468: metadata issuer must match the discovery issuer
-                            if self.context.auth_server_url is not None:
-                                validate_metadata_issuer(asm, self.context.auth_server_url)
-                            self.context.oauth_metadata = asm
-                            break
-                        else:
-                            logger.debug(f"OAuth metadata discovery failed: {url}")
-
-                    # SEP-2352: on the legacy no-PRM path the issuer is only known after ASM
-                    # discovery, so re-evaluate the binding here using the discovered metadata
-                    # issuer (mirroring the bound_issuer fallback in Step 4).
-                    if (
-                        self.context.client_info is not None
-                        and self.context.auth_server_url is None
-                        and self.context.oauth_metadata is not None
-                        and not credentials_match_issuer(
-                            self.context.client_info,
-                            str(self.context.oauth_metadata.issuer),
-                            self.context.client_metadata_url,
-                        )
-                    ):
-                        logger.debug("Authorization server changed; discarding bound credentials and re-registering")
-                        self.context.client_info = None
-                        self.context.clear_tokens()
-
-                    # Step 3: Apply scope selection strategy
-                    self.context.client_metadata.scope = get_client_metadata_scopes(
-                        extract_scope_from_www_auth(response),
-                        self.context.protected_resource_metadata,
-                        self.context.oauth_metadata,
-                        self.context.client_metadata.grant_types,
-                    )
-
-                    # Step 4: Register client or use URL-based client ID (CIMD)
-                    if not self.context.client_info:
-                        # SEP-2352: the issuer to bind these credentials to, when known.
-                        discovered_issuer: str | None = None
-                        if self.context.oauth_metadata is not None:
-                            discovered_issuer = self.context.auth_server_url or str(self.context.oauth_metadata.issuer)
-
-                        if should_use_client_metadata_url(
-                            self.context.oauth_metadata, self.context.client_metadata_url
-                        ):
-                            # Use URL-based client ID (CIMD). CIMD records are portable across
-                            # authorization servers, so the issuer stamp is informational.
-                            logger.debug(f"Using URL-based client ID (CIMD): {self.context.client_metadata_url}")
-                            client_information = create_client_info_from_metadata_url(
-                                self.context.client_metadata_url,  # type: ignore[arg-type]
-                                redirect_uris=self.context.client_metadata.redirect_uris,
-                            )
-                            client_information.issuer = discovered_issuer
-                            self.context.client_info = client_information
-                            await self.context.storage.set_client_info(client_information)
-                        else:
-                            # Fallback to Dynamic Client Registration
-                            fallback_base = self.context.get_authorization_base_url(self.context.server_url)
-                            registration_request = create_client_registration_request(
-                                self.context.oauth_metadata, self.context.client_metadata, fallback_base
-                            )
-                            registration_response = yield registration_request
-                            client_information = await handle_registration_response(registration_response)
-                            check_registration_usable(client_information)
-                            # Only record the issuer when the registration above actually targeted
-                            # the discovered AS — either via its published registration_endpoint,
-                            # or because the resource-origin /register fallback is on the issuer's
-                            # own host (legacy same-origin embedded AS). Otherwise the fallback hit
-                            # a different server and recording a binding to the PRM-advertised AS
-                            # would persist a binding that was never established.
-                            if (
-                                self.context.oauth_metadata is not None
-                                and discovered_issuer is not None
-                                and (
-                                    self.context.oauth_metadata.registration_endpoint is not None
-                                    or self.context.get_authorization_base_url(discovered_issuer) == fallback_base
-                                )
-                            ):
-                                client_information.issuer = discovered_issuer
-                            self.context.client_info = client_information
-                            await self.context.storage.set_client_info(client_information)
-
-                    # Step 5: Perform authorization and complete token exchange
-                    token_response = yield await self._perform_authorization()
-                    await self._handle_token_response(token_response)
+                    async with aclosing(self._reacquire_tokens(challenge=response)) as steps:
+                        try:
+                            step = await steps.__anext__()
+                            while True:
+                                step = await steps.asend((yield step))
+                        except StopAsyncIteration:
+                            pass
                 except Exception:
                     logger.exception("OAuth flow error")
                     raise

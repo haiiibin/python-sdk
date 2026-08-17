@@ -51,6 +51,11 @@ The in-memory version above works. It also forgets everything when the process e
 !!! tip
     Store `client_info`, not only the tokens. The provider registers dynamically the first time it
     finds no stored `client_info`. Throw it away and you mint a fresh registration on every run.
+    The one case where the provider throws it away for you is a registration it made that has
+    stopped working: its `client_secret_expires_at` has passed, or the token endpoint answered
+    `invalid_client`. Then it registers again and overwrites the stored record. Credentials you
+    seeded into storage yourself are never replaced this way; an `invalid_client` for those
+    surfaces as an `OAuthTokenError`.
 
 ### The two handlers
 
@@ -81,7 +86,7 @@ The first time `Client` sends a request, the server answers `401`. The provider 
 3. **Authorization.** It generates the PKCE pair and a `state`, builds the authorization URL, awaits your `redirect_handler`, then awaits your `callback_handler` for the code.
 4. **Exchange.** It trades the code for an `OAuthToken`, stores it, and replays your original request with `Authorization: Bearer ...`.
 
-After that it is quiet. Tokens come out of storage, an expired access token is refreshed with the refresh token, and only when none of that works does it run the flow again.
+After that it is quiet. Tokens come out of storage, an expired access token is refreshed with the refresh token, and only when none of that works does it run the flow again. That holds across restarts: a new process that finds a refresh token in storage answers the first `401` by rediscovering the authorization server and refreshing, not by sending anyone back to the browser.
 
 You wrote none of it. Two keyword arguments remain (`client_metadata_url` and `validate_resource_url`), and this file needs neither. `client_metadata_url` is the one worth knowing about; it gets its own section below.
 

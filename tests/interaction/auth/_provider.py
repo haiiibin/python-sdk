@@ -103,6 +103,25 @@ class InMemoryAuthorizationServerProvider(
         )
         return access
 
+    def expire_access_token(self, token: str) -> None:
+        """Move an issued access token's server-side expiry into the past so the bearer middleware 401s it.
+
+        Models time passing between two client processes: the token the first process stored is
+        no longer accepted when the second presents it.
+        """
+        self.access_tokens[token] = self.access_tokens[token].model_copy(update={"expires_at": int(time.time()) - 1})
+
+    def lapse_client_secret(self, client_id: str) -> None:
+        """Move a registered client's `client_secret_expires_at` into the past so the token endpoint rejects it.
+
+        The SDK's client authenticator answers `invalid_client` ("Client secret has expired") for
+        every grant once this is set, which is how an authorization server that issues expiring
+        registration secrets behaves after the window passes.
+        """
+        self.clients[client_id] = self.clients[client_id].model_copy(
+            update={"client_secret_expires_at": int(time.time()) - 1}
+        )
+
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self.clients.get(client_id)
 

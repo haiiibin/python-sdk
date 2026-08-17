@@ -114,6 +114,6 @@ class ClientAuthenticator:
                 raise AuthenticationError("Invalid client_secret")
 
             if client.client_secret_expires_at and client.client_secret_expires_at < int(time.time()):
-                raise AuthenticationError("Client secret has expired")  # pragma: no cover
+                raise AuthenticationError("Client secret has expired")
 
         return client
