@@ -7,7 +7,9 @@ Version 2 of the MCP Python SDK introduces several breaking changes to improve t
 !!! note "Not ready to migrate yet?"
     The v1.x maintenance line keeps receiving critical bug fixes and security patches, and its
     documentation is at [/v1/](https://py.sdk.modelcontextprotocol.io/v1/). If your package depends
-    on `mcp`, keep a `<2` upper bound until you've migrated.
+    on `mcp`, keep a `<2` upper bound until you've migrated. If you publish a package that has to
+    work on both majors during the transition, see
+    [Supporting v1 and v2 at the same time](compatibility.md).
 
 ## Find your changes
 

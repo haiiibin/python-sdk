@@ -70,6 +70,7 @@ nav:
   - Troubleshooting: troubleshooting.md
   - Translations: translations.md
   - Migration Guide: migration.md
+  - Supporting v1 and v2 together: compatibility.md
   - API Reference: api/
 
 theme:
